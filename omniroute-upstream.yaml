@@ -1,0 +1,56 @@
+# OmniRoute (self-hosted AI gateway, 192.168.100.50:20128) registered as a
+# Kong-managed internal upstream. The finops-arbitrage-router reaches it ONLY
+# through this hostname (max-performance fallback leg) so Kong access logs,
+# observability and the platform zero-trust model keep applying.
+# The upstream lives OUTSIDE the cluster, hence the manual Endpoints object:
+# the ClusterIP Service has no selector and binds to these endpoints.
+apiVersion: v1
+kind: Service
+metadata:
+  name: omniroute-upstream
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+    backstage.io/kubernetes-id: finops-arbitrage-router
+spec:
+  ports:
+    - name: http
+      port: 80
+      targetPort: 20128
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: omniroute-upstream
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+    backstage.io/kubernetes-id: finops-arbitrage-router
+subsets:
+  - addresses:
+      - ip: 192.168.100.50
+    ports:
+      - name: http
+        port: 20128
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: omniroute-upstream
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+    backstage.io/kubernetes-id: finops-arbitrage-router
+spec:
+  ingressClassName: kong
+  rules:
+    - host: omniroute-internal.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: omniroute-upstream
+                port:
+                  number: 80
