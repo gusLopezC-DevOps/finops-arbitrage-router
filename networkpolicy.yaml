@@ -1,0 +1,44 @@
+# Zero-trust egress for the router: it may only reach DNS, the local Ollama
+# model and (when a managed fallback is configured) the public internet. When
+# priority is cost-optimized the internet egress block should be removed so no
+# traffic can leave the cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: finops-arbitrage-router-egress
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+spec:
+  podSelector:
+    matchLabels:
+      app: finops-arbitrage-router
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ml-serving
+      ports:
+        - protocol: TCP
+          port: 11434
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

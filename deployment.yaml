@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finops-arbitrage-router
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+    backstage.io/kubernetes-id: finops-arbitrage-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: finops-arbitrage-router
+  template:
+    metadata:
+      labels:
+        app: finops-arbitrage-router
+        backstage.io/kubernetes-id: finops-arbitrage-router
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: router
+          image: python:3.12-slim
+          command: ["python", "/app/router.py"]
+          env:
+            - name: ROUTER_PRIORITY
+              value: "cost-optimized"
+            - name: LOCAL_MODEL
+              value: "llama3.2:1b"
+            - name: FALLBACK_ENDPOINT
+              value: ""
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          volumeMounts:
+            - name: router
+              mountPath: /app
+              readOnly: true
+            - name: sla
+              mountPath: /etc/sla
+              readOnly: true
+      volumes:
+        - name: router
+          configMap:
+            name: finops-arbitrage-router-router
+        - name: sla
+          configMap:
+            name: finops-arbitrage-router-sla
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: finops-arbitrage-router
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+    backstage.io/kubernetes-id: finops-arbitrage-router
+spec:
+  selector:
+    app: finops-arbitrage-router
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

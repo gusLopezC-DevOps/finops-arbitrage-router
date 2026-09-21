@@ -1,0 +1,19 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: finops-arbitrage-router
+  description: FinOps arbitrage router (cost-optimized) with declared cost/latency SLA
+  labels:
+    app: finops-arbitrage-router
+  tags:
+    - llm
+    - finops
+    - routing
+  annotations:
+    backstage.io/kubernetes-id: finops-arbitrage-router
+    backstage.io/kubernetes-namespace: finops-arbitrage-router
+spec:
+  type: service
+  lifecycle: production
+  owner: group:mlops-team
+  system: mlops-platform

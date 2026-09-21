@@ -1,0 +1,25 @@
+# Public entrypoint for the arbitrage router. Kong applies the same DLP controls
+# as every other LLM route; routing decisions are driven by the SLA ConfigMap.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: finops-arbitrage-router
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+    backstage.io/kubernetes-id: finops-arbitrage-router
+  annotations:
+    konghq.com/plugins: pii-redaction,ai-prompt-guard
+spec:
+  ingressClassName: kong
+  rules:
+    - host: finops.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: finops-arbitrage-router
+                port:
+                  number: 8080

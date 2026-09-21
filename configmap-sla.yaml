@@ -1,0 +1,28 @@
+# Declarative FinOps SLA consumed by the router. The platform reads this to
+# decide where traffic goes: local Ollama CPU (cost-optimized) or the managed
+# fallback (max-performance / SLA breach). GPU spot arbitrage is roadmap only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: finops-arbitrage-router-sla
+  namespace: finops-arbitrage-router
+  labels:
+    app: finops-arbitrage-router
+    backstage.io/kubernetes-id: finops-arbitrage-router
+data:
+  sla.yaml: |
+    priority: cost-optimized
+    cost:
+      max_usd_per_1k_tokens: 0.5
+    latency:
+      max_p95_ms: 2000
+    routing:
+      local:
+        provider: ollama
+        endpoint: http://ollama-cpu.ml-serving.svc.cluster.local:11434
+        model: llama3.2:1b
+      managed_fallback:
+        endpoint: ""
+      gpu_spot:
+        enabled: false
+        note: "Roadmap: requires Crossplane cloud provider + KEDA (not installed)."
