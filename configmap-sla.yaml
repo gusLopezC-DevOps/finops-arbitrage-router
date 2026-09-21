@@ -22,7 +22,13 @@ data:
         endpoint: http://ollama-cpu.ml-serving.svc.cluster.local:11434
         model: llama3.2:1b
       managed_fallback:
-        endpoint: ""
+        provider: omniroute
+        endpoint: http://omniroute-internal.local
+        upstream: http://192.168.100.50:20128
+        scope: LAN-only, no public DNS or TLS by design (Kong Ingress class
+          kong + hostAliases; resolved via /etc/hosts on LAN nodes)
+        auth: SealedSecret finops-arbitrage-router-fallback (Bearer, sent on
+          the fallback leg only; the local leg never sends credentials)
       gpu_spot:
         enabled: false
         note: "Roadmap: requires Crossplane cloud provider + KEDA (not installed)."
