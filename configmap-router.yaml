@@ -15,6 +15,7 @@ data:
     LOCAL = os.environ.get("LOCAL_ENDPOINT", "http://ollama-cpu.ml-serving.svc.cluster.local:11434").rstrip("/")
     LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "llama3.2:1b")
     FALLBACK = os.environ.get("FALLBACK_ENDPOINT", "").rstrip("/")
+    FALLBACK_KEY = os.environ.get("FALLBACK_API_KEY", "")
 
     def route():
         # cost-optimized pins traffic to the local Ollama CPU model.
@@ -31,10 +32,15 @@ data:
             if model:
                 payload.setdefault("model", model)
             payload["stream"] = False
+            headers = {"Content-Type": "application/json"}
+            if model is None and FALLBACK_KEY:
+                # Managed fallback leg (OmniRoute via Kong): bearer auth.
+                # The local Ollama leg never sends credentials.
+                headers["Authorization"] = "Bearer " + FALLBACK_KEY
             req = urllib.request.Request(
                 endpoint,
                 data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
             with urllib.request.urlopen(req, timeout=120) as resp:
                 body = resp.read()

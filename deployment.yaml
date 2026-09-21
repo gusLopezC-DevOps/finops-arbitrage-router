@@ -17,6 +17,13 @@ spec:
         app: finops-arbitrage-router
         backstage.io/kubernetes-id: finops-arbitrage-router
     spec:
+      # Pods cannot resolve *.local via cluster DNS, so pin the
+      # Kong-managed OmniRoute hostname to the Kong LB (same pattern as
+      # /etc/hosts entries on the nodes). No CoreDNS change required.
+      hostAliases:
+        - ip: "192.168.100.77"
+          hostnames:
+            - "omniroute-internal.local"
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -33,7 +40,12 @@ spec:
             - name: LOCAL_MODEL
               value: "llama3.2:1b"
             - name: FALLBACK_ENDPOINT
-              value: ""
+              value: "http://omniroute-internal.local"
+            - name: FALLBACK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: finops-arbitrage-router-fallback
+                  key: api-key
           ports:
             - name: http
               containerPort: 8080

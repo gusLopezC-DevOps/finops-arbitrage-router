@@ -1,7 +1,7 @@
 # Zero-trust egress for the router: it may only reach DNS, the local Ollama
-# model and (when a managed fallback is configured) the public internet. When
-# priority is cost-optimized the internet egress block should be removed so no
-# traffic can leave the cluster.
+# model, and the Kong load-balancer (port 80) which fronts both finops.local
+# and the managed OmniRoute fallback (omniroute-internal.local). There is NO
+# public-internet egress: the fallback leg stays on the LAN behind Kong.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -34,11 +34,7 @@ spec:
           port: 11434
     - to:
         - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
+            cidr: 192.168.100.77/32
       ports:
         - protocol: TCP
-          port: 443
+          port: 80
