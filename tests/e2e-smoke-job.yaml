@@ -8,7 +8,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: finops-e2e-smoke-v2
+  name: finops-e2e-smoke-v3
   namespace: finops-arbitrage-router
   labels:
     app: finops-arbitrage-router-e2e
@@ -64,9 +64,10 @@ spec:
 
               # Leg B: max-performance -> OmniRoute via Kong (managed fallback).
               data = post({
-                  "model": "groq/llama-3.3-70b-versatile",
+                  "model": "groq/openai/gpt-oss-20b",
                   "messages": [{"role": "user", "content": "Reply with exactly four words, no more"}],
                   "stream": False,
+                  "max_tokens": 500,
               }, headers={"X-Router-Priority": "max-performance"})
               assert "choices" in data, f"fallback leg did not return OpenAI shape: {json.dumps(data)[:200]}"
               reply = reply_text(data)
