@@ -35,3 +35,22 @@ FinOps charge back to the owning team's cost centre.
   Crossplane cloud provider (AWS/GCP) and KEDA, which are **not** part of the
   current platform. The `gpu_spot` block in the SLA ConfigMap is intentionally
   `enabled: false` until those dependencies exist.
+
+## OmniRoute fallback (max-performance leg)
+
+The managed fallback is OmniRoute (`192.168.100.50:20128`), registered in Kong
+as the internal hostname `omniroute-internal.local` (`omniroute-upstream.yaml`:
+Service + Ingress class `kong`). The router reaches it only through Kong, so
+access logs, observability and zero-trust keep applying; the egress
+NetworkPolicy allows just `Kong-LB:80` (no public internet).
+
+Per-request priority: clients send `X-Router-Priority: max-performance`
+(or a `"priority"` body field) to take the fallback leg; otherwise the
+Deployment default (`cost-optimized`) applies. The fallback bearer key lives
+in the SealedSecret `finops-arbitrage-router-fallback` (never in clear).
+
+> Platform note: Argo CD excludes endpoint resources (`Endpoints` and
+> `EndpointSlice`) from management, so `omniroute-upstream-1` (EndpointSlice
+> pinning the Service to `192.168.100.50:20128`) is applied out-of-band
+> (`kubectl apply -f omniroute-upstream.yaml` for that object only). The YAML
+> stays in Git as source of truth; re-apply it if the slice is ever deleted.

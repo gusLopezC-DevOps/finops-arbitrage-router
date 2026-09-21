@@ -1,12 +1,14 @@
 # GitOps smoke test for the FinOps arbitrage router (runs via Argo CD sync).
-# POSTs a tiny chat request to the router Service; the router must forward it
-# to the local Ollama model (cost-optimized) and return real tokens.
+# Exercises BOTH legs without touching the Deployment:
+#  (a) default cost-optimized -> local Ollama model, real tokens, free;
+#  (b) X-Router-Priority: max-performance -> OmniRoute via Kong, real tokens
+#      from the managed provider (consumes a few tokens per run).
 # NOTE: pod labels deliberately differ from `app: finops-arbitrage-router`
 # so the router's egress NetworkPolicy does not apply to this test pod.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: finops-e2e-smoke
+  name: finops-e2e-smoke-v2
   namespace: finops-arbitrage-router
   labels:
     app: finops-arbitrage-router-e2e
@@ -33,23 +35,43 @@ spec:
           args:
             - |
               import json, sys, urllib.request
-              body = json.dumps({
+
+              def post(body, headers=None):
+                  h = {"Content-Type": "application/json"}
+                  h.update(headers or {})
+                  req = urllib.request.Request(
+                      "http://finops-arbitrage-router:8080/v1/chat/completions",
+                      data=json.dumps(body).encode(), headers=h)
+                  with urllib.request.urlopen(req, timeout=150) as r:
+                      assert r.status == 200, f"router status {r.status}"
+                      return json.loads(r.read())
+
+              def reply_text(data):
+                  try:
+                      return data["message"]["content"]
+                  except KeyError:
+                      return data["choices"][0]["message"]["content"]
+
+              # Leg A: cost-optimized (default) -> local Ollama, free.
+              data = post({
                   "model": "llama3.2:1b",
                   "messages": [{"role": "user", "content": "Responde con exactamente tres palabras"}],
                   "stream": False,
-              }).encode()
-              req = urllib.request.Request(
-                  "http://finops-arbitrage-router:8080/v1/chat/completions",
-                  data=body, headers={"Content-Type": "application/json"})
-              with urllib.request.urlopen(req, timeout=150) as r:
-                  assert r.status == 200, f"router status {r.status}"
-                  data = json.loads(r.read())
-              try:
-                  reply = data["message"]["content"]
-              except KeyError:
-                  reply = data["choices"][0]["message"]["content"]
-              print("E2E OK, router reply:", reply.strip(), flush=True)
+              })
+              reply = reply_text(data)
+              print("E2E OK [cost-optimized], router reply:", reply.strip(), flush=True)
               assert reply.strip(), "empty reply from router"
+
+              # Leg B: max-performance -> OmniRoute via Kong (managed fallback).
+              data = post({
+                  "model": "groq/llama-3.3-70b-versatile",
+                  "messages": [{"role": "user", "content": "Reply with exactly four words, no more"}],
+                  "stream": False,
+              }, headers={"X-Router-Priority": "max-performance"})
+              assert "choices" in data, f"fallback leg did not return OpenAI shape: {json.dumps(data)[:200]}"
+              reply = reply_text(data)
+              print("E2E OK [max-performance], provider model:", data.get("model"), "reply:", reply.strip(), flush=True)
+              assert reply.strip(), "empty reply from fallback"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

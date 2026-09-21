@@ -17,10 +17,10 @@ data:
     FALLBACK = os.environ.get("FALLBACK_ENDPOINT", "").rstrip("/")
     FALLBACK_KEY = os.environ.get("FALLBACK_API_KEY", "")
 
-    def route():
+    def route(priority):
         # cost-optimized pins traffic to the local Ollama CPU model.
         # max-performance prefers the managed OpenAI-compatible fallback when set.
-        if PRIORITY == "max-performance" and FALLBACK:
+        if priority == "max-performance" and FALLBACK:
             return FALLBACK + "/v1/chat/completions", None
         return LOCAL + "/api/chat", LOCAL_MODEL
 
@@ -28,7 +28,11 @@ data:
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            endpoint, model = route()
+            # Per-request priority wins (header, then body field), else the
+            # Deployment default. The body field is popped so backends never
+            # see it. Lets the GitOps e2e exercise BOTH legs without flips.
+            priority = self.headers.get("X-Router-Priority", payload.pop("priority", PRIORITY))
+            endpoint, model = route(priority)
             if model:
                 payload.setdefault("model", model)
             payload["stream"] = False
@@ -42,8 +46,18 @@ data:
                 data=json.dumps(payload).encode(),
                 headers=headers,
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = resp.read()
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = resp.read()
+            except Exception as exc:
+                # Never kill the socket: a backend failure must be a clean
+                # JSON error, otherwise Kong reports "invalid upstream response".
+                body = json.dumps({"error": "backend failed: %s" % exc}).encode()
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
