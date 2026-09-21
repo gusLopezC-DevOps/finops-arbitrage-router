@@ -44,6 +44,13 @@ Service + Ingress class `kong`). The router reaches it only through Kong, so
 access logs, observability and zero-trust keep applying; the egress
 NetworkPolicy allows just `Kong-LB:80` (no public internet).
 
+> LAN-only by design: OmniRoute lives only on the local network. There is no
+> public DNS, no TLS/cert-manager and no exposure outside the LAN — both
+> `finops.local` and `omniroute-internal.local` resolve via `/etc/hosts` on
+> LAN nodes (`192.168.100.77`, the Kong MetalLB IP) plus `hostAliases` in the
+> router pods. Do NOT add a public Ingress/TLS for the fallback; the SLA
+> (`configmap-sla.yaml`, `managed_fallback.scope`) pins this down.
+
 Per-request priority: clients send `X-Router-Priority: max-performance`
 (or a `"priority"` body field) to take the fallback leg; otherwise the
 Deployment default (`cost-optimized`) applies. The fallback bearer key lives
