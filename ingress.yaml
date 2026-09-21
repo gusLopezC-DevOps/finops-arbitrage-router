@@ -1,5 +1,7 @@
-# Public entrypoint for the arbitrage router. Kong applies the same DLP controls
-# as every other LLM route; routing decisions are driven by the SLA ConfigMap.
+# Public entrypoint for the arbitrage router (plain Kong route, no plugins:
+# the pii-redaction / ai-prompt-guard KongPlugins are roadmap and do not exist
+# in this cluster yet — referencing them makes Kong answer 500. Re-add the
+# konghq.com/plugins annotation once the DLP plugins are installed).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -8,8 +10,6 @@ metadata:
   labels:
     app: finops-arbitrage-router
     backstage.io/kubernetes-id: finops-arbitrage-router
-  annotations:
-    konghq.com/plugins: pii-redaction,ai-prompt-guard
 spec:
   ingressClassName: kong
   rules:
