@@ -36,10 +36,13 @@ data:
             if model:
                 payload.setdefault("model", model)
             payload["stream"] = False
-            headers = {"Content-Type": "application/json"}
+            headers = {"Content-Type": "application/json", "User-Agent": "finops-arbitrage-router/1.0"}
             if model is None and FALLBACK_KEY:
                 # Managed fallback leg (OmniRoute via Kong): bearer auth.
                 # The local Ollama leg never sends credentials.
+                # NOTE: the stdlib default UA (Python-urllib) is banned by the
+                # Cloudflare bot wall in front of some providers (error 1010),
+                # hence the neutral UA above.
                 headers["Authorization"] = "Bearer " + FALLBACK_KEY
             req = urllib.request.Request(
                 endpoint,
