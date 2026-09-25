@@ -13,6 +13,8 @@ spec:
       app: finops-arbitrage-router
   template:
     metadata:
+      annotations:
+        backstage.guslopez.dev/config-checksum: "sha256:0f33af3017dee929f6f02bc9419c247918922123961e510dc408b934b921f74b"
       labels:
         app: finops-arbitrage-router
         backstage.io/kubernetes-id: finops-arbitrage-router
@@ -48,6 +50,12 @@ spec:
                 secretKeyRef:
                   name: finops-arbitrage-router-fallback
                   key: api-key
+            - name: LOCAL_ENDPOINT
+              value: "http://ollama-cpu.ml-serving.svc.cluster.local:11434"
+            - name: CROSS_LEG_FALLBACK
+              value: "true"
+            - name: UPSTREAM_TIMEOUT
+              value: "120"
           ports:
             - name: http
               containerPort: 8080
