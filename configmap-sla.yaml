@@ -25,6 +25,7 @@ data:
         provider: omniroute
         endpoint: http://omniroute-internal.local
         upstream: http://192.168.100.50:20128
+        model: auto/best-chat
         scope: LAN-only, no public DNS or TLS by design (Kong Ingress class
           kong + hostAliases; resolved via /etc/hosts on LAN nodes)
         auth: SealedSecret finops-arbitrage-router-fallback (Bearer, sent on

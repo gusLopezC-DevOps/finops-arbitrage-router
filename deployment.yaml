@@ -41,6 +41,8 @@ spec:
               value: "llama3.2:1b"
             - name: FALLBACK_ENDPOINT
               value: "http://omniroute-internal.local"
+            - name: FALLBACK_MODEL
+              value: "auto/best-chat"
             - name: FALLBACK_API_KEY
               valueFrom:
                 secretKeyRef:

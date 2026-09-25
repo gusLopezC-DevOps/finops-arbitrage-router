@@ -8,21 +8,30 @@ metadata:
     backstage.io/kubernetes-id: finops-arbitrage-router
 data:
   router.py: |
-    import json, os, urllib.request
+    import json, os, urllib.error, urllib.request
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     PRIORITY = os.environ.get("ROUTER_PRIORITY", "cost-optimized")
     LOCAL = os.environ.get("LOCAL_ENDPOINT", "http://ollama-cpu.ml-serving.svc.cluster.local:11434").rstrip("/")
     LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "llama3.2:1b")
     FALLBACK = os.environ.get("FALLBACK_ENDPOINT", "").rstrip("/")
+    FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "auto/best-chat")
     FALLBACK_KEY = os.environ.get("FALLBACK_API_KEY", "")
 
     def route(priority):
         # cost-optimized pins traffic to the local Ollama CPU model.
         # max-performance prefers the managed OpenAI-compatible fallback when set.
         if priority == "max-performance" and FALLBACK:
-            return FALLBACK + "/v1/chat/completions", None
-        return LOCAL + "/api/chat", LOCAL_MODEL
+            return {"endpoint": FALLBACK + "/v1/chat/completions", "fallback": True}
+        return {"endpoint": LOCAL + "/api/chat", "fallback": False}
+
+    def apply_model(payload, target):
+        if not target["fallback"]:
+            payload.setdefault("model", LOCAL_MODEL)
+            return
+        requested = payload.get("model")
+        if not requested or "/" not in requested:
+            payload["model"] = FALLBACK_MODEL
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -32,12 +41,11 @@ data:
             # Deployment default. The body field is popped so backends never
             # see it. Lets the GitOps e2e exercise BOTH legs without flips.
             priority = self.headers.get("X-Router-Priority", payload.pop("priority", PRIORITY))
-            endpoint, model = route(priority)
-            if model:
-                payload.setdefault("model", model)
+            target = route(priority)
+            apply_model(payload, target)
             payload["stream"] = False
             headers = {"Content-Type": "application/json", "User-Agent": "finops-arbitrage-router/1.0"}
-            if model is None and FALLBACK_KEY:
+            if target["fallback"] and FALLBACK_KEY:
                 # Managed fallback leg (OmniRoute via Kong): bearer auth.
                 # The local Ollama leg never sends credentials.
                 # NOTE: the stdlib default UA (Python-urllib) is banned by the
@@ -45,23 +53,30 @@ data:
                 # hence the neutral UA above.
                 headers["Authorization"] = "Bearer " + FALLBACK_KEY
             req = urllib.request.Request(
-                endpoint,
+                target["endpoint"],
                 data=json.dumps(payload).encode(),
                 headers=headers,
             )
             try:
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     body = resp.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()[:500].decode("utf-8", "replace")
+                self._fail("backend failed: HTTP %s: %s" % (exc.code, detail))
+                return
             except Exception as exc:
-                # Never kill the socket: a backend failure must be a clean
-                # JSON error, otherwise Kong reports "invalid upstream response".
-                body = json.dumps({"error": "backend failed: %s" % exc}).encode()
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(body)
+                self._fail("backend failed: %s" % exc)
                 return
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _fail(self, message):
+            # Never kill the socket: a backend failure must be a clean
+            # JSON error, otherwise Kong reports "invalid upstream response".
+            body = json.dumps({"error": message}).encode()
+            self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
