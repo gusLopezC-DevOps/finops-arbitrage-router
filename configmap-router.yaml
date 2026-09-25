@@ -8,7 +8,7 @@ metadata:
     backstage.io/kubernetes-id: finops-arbitrage-router
 data:
   router.py: |
-    import json, os, urllib.error, urllib.request
+    import json, os, sys, time, urllib.error, urllib.request
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     PRIORITY = os.environ.get("ROUTER_PRIORITY", "cost-optimized")
@@ -17,68 +17,152 @@ data:
     FALLBACK = os.environ.get("FALLBACK_ENDPOINT", "").rstrip("/")
     FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "auto/best-chat")
     FALLBACK_KEY = os.environ.get("FALLBACK_API_KEY", "")
+    # When the primary leg fails, retry once on the other leg instead of
+    # returning 502 to the caller. Set to false to fail closed.
+    CROSS_LEG = os.environ.get("CROSS_LEG_FALLBACK", "true").strip().lower() not in ("false", "0", "no")
+    TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "120"))
+    RETRY_STATUS = {408, 425, 429}
 
-    def route(priority):
-        # cost-optimized pins traffic to the local Ollama CPU model.
-        # max-performance prefers the managed OpenAI-compatible fallback when set.
-        if priority == "max-performance" and FALLBACK:
-            return {"endpoint": FALLBACK + "/v1/chat/completions", "fallback": True}
-        return {"endpoint": LOCAL + "/api/chat", "fallback": False}
 
-    def apply_model(payload, target):
-        if not target["fallback"]:
-            payload.setdefault("model", LOCAL_MODEL)
+    def warn(message):
+        sys.stderr.write("%s router: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), message))
+        sys.stderr.flush()
+
+
+    def legs(priority):
+        # Ordered candidates: the requested leg first, the other one as backup.
+        managed = {
+            "name": "managed",
+            "url": FALLBACK + "/v1/chat/completions",
+            "fallback": True,
+        } if FALLBACK else None
+        local = {"name": "local", "url": LOCAL + "/api/chat", "fallback": False}
+        want_managed = priority == "max-performance" and FALLBACK
+        primary, backup = (managed, local) if want_managed else (local, managed)
+        ordered = [primary]
+        if CROSS_LEG and backup is not None:
+            ordered.append(backup)
+        return ordered
+
+
+    def apply_model(payload, leg):
+        # The local leg only knows LOCAL_MODEL, so a provider-prefixed request
+        # (groq/openai/gpt-oss-20b) or an OpenAI alias must not be forwarded.
+        if not leg["fallback"]:
+            payload["model"] = LOCAL_MODEL
             return
         requested = payload.get("model")
         if not requested or "/" not in requested:
             payload["model"] = FALLBACK_MODEL
 
+
+    def is_retryable(exc):
+        # Any other 4xx is a client error: retrying the other leg would only
+        # turn a clear 400/404 into an opaque 502.
+        if isinstance(exc, urllib.error.HTTPError):
+            return exc.code in RETRY_STATUS or exc.code >= 500
+        return True
+
+
+    def describe(exc):
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                detail = exc.read()[:300].decode("utf-8", "replace")
+            except Exception:
+                detail = exc.reason if isinstance(exc.reason, str) else ""
+            return "HTTP %s: %s" % (exc.code, detail)
+        return "%s: %s" % (type(exc).__name__, exc)
+
+
+    def to_openai(data, model):
+        # Ollama /api/chat -> OpenAI chat.completions, so callers of this
+        # OpenAI-compatible endpoint get one shape regardless of the leg.
+        message = data.get("message") or {}
+        prompt_tokens = data.get("prompt_eval_count") or 0
+        completion_tokens = data.get("eval_count") or 0
+        return {
+            "id": data.get("id") or "chatcmpl-local",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": data.get("model") or model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": message.get("role") or "assistant",
+                            "content": message.get("content", "")},
+                "finish_reason": data.get("done_reason") or "stop",
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+
+
+    def call(leg, payload, timeout):
+        headers = {"Content-Type": "application/json", "User-Agent": "finops-arbitrage-router/1.0"}
+        if leg["fallback"] and FALLBACK_KEY:
+            # Managed leg (OmniRoute via Kong): bearer auth. The local leg
+            # never sends credentials. The stdlib default UA is banned by the
+            # Cloudflare bot wall in front of some providers (error 1010).
+            headers["Authorization"] = "Bearer " + FALLBACK_KEY
+        req = urllib.request.Request(leg["url"], data=json.dumps(payload).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read() or b"{}")
+
+
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(length) or b"{}")
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                self._fail("invalid JSON", 400)
+                return
             # Per-request priority wins (header, then body field), else the
             # Deployment default. The body field is popped so backends never
             # see it. Lets the GitOps e2e exercise BOTH legs without flips.
             priority = self.headers.get("X-Router-Priority", payload.pop("priority", PRIORITY))
-            target = route(priority)
-            apply_model(payload, target)
-            payload["stream"] = False
-            headers = {"Content-Type": "application/json", "User-Agent": "finops-arbitrage-router/1.0"}
-            if target["fallback"] and FALLBACK_KEY:
-                # Managed fallback leg (OmniRoute via Kong): bearer auth.
-                # The local Ollama leg never sends credentials.
-                # NOTE: the stdlib default UA (Python-urllib) is banned by the
-                # Cloudflare bot wall in front of some providers (error 1010),
-                # hence the neutral UA above.
-                headers["Authorization"] = "Bearer " + FALLBACK_KEY
-            req = urllib.request.Request(
-                target["endpoint"],
-                data=json.dumps(payload).encode(),
-                headers=headers,
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    body = resp.read()
-            except urllib.error.HTTPError as exc:
-                detail = exc.read()[:500].decode("utf-8", "replace")
-                self._fail("backend failed: HTTP %s: %s" % (exc.code, detail))
+            candidates = legs(priority)
+            errors = []
+            for index, leg in enumerate(candidates):
+                attempt = dict(payload)
+                attempt["stream"] = False
+                apply_model(attempt, leg)
+                try:
+                    data = call(leg, attempt, TIMEOUT)
+                except Exception as exc:
+                    reason = describe(exc)
+                    errors.append("%s leg: %s" % (leg["name"], reason))
+                    last = index == len(candidates) - 1
+                    if not is_retryable(exc) or last:
+                        self._fail("; ".join(errors), 502)
+                        return
+                    warn("%s leg failed, falling back: %s" % (leg["name"], reason))
+                    continue
+                if not leg["fallback"]:
+                    data = to_openai(data, attempt["model"])
+                self._ok(data, leg, index > 0)
                 return
-            except Exception as exc:
-                self._fail("backend failed: %s" % exc)
-                return
+            self._fail("; ".join(errors) or "no upstream available", 502)
+
+        def _ok(self, data, leg, fell_back):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("X-Router-Leg", leg["name"])
+            self.send_header("X-Router-Fallback", "true" if fell_back else "false")
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(json.dumps(data).encode())
 
-        def _fail(self, message):
+        def _fail(self, message, status=502):
             # Never kill the socket: a backend failure must be a clean
             # JSON error, otherwise Kong reports "invalid upstream response".
-            body = json.dumps({"error": message}).encode()
-            self.send_response(502)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            self.send_header("X-Router-Leg", "none")
+            self.send_header("X-Router-Fallback", "false")
             self.end_headers()
+            body = json.dumps({"error": message}).encode()
             self.wfile.write(body)
 
         def do_GET(self):
@@ -92,5 +176,6 @@ data:
 
         def log_message(self, *args):
             pass
+
 
     HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
