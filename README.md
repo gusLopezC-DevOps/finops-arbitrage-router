@@ -56,6 +56,12 @@ Per-request priority: clients send `X-Router-Priority: max-performance`
 Deployment default (`cost-optimized`) applies. The fallback bearer key lives
 in the SealedSecret `finops-arbitrage-router-fallback` (never in clear).
 
+Model resolution is owned by the router: the local leg defaults to
+`LOCAL_MODEL`, and the fallback leg defaults to `FALLBACK_MODEL`
+(`auto/best-chat`) whenever the caller omits the model or sends a local model
+name such as `llama3.2:1b`, which the managed gateway cannot resolve. A
+provider-prefixed model (`groq/openai/gpt-oss-20b`) is forwarded untouched.
+
 > Platform note: Argo CD excludes endpoint resources (`Endpoints` and
 > `EndpointSlice`) from management, so `omniroute-upstream-1` (EndpointSlice
 > pinning the Service to `192.168.100.50:20128`) is applied out-of-band
