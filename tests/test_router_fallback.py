@@ -388,15 +388,30 @@ class MetricsTest(unittest.TestCase):
         stub_upstream(module, [OPENAI_REPLY])
         post(module, json.dumps({"messages": []}))
         series, _ = parse_exposition(get(module, "/metrics")[2])
+        bounds = ("0.05", "0.1", "0.25", "0.5", "1", "2.5", "5",
+                  "10", "30", "60", "120", "300", "+Inf")
         buckets = [(bound, series['router_request_duration_seconds_bucket{le="%s",leg="managed"}' % bound])
-                   for bound in ("0.05", "0.1", "0.25", "0.5", "1", "2.5", "5",
-                                 "10", "30", "60", "120", "300")]
+                   for bound in bounds]
         counts = [count for _, count in buckets]
         self.assertEqual(counts, sorted(counts), "buckets must be monotonic")
         self.assertEqual(series['router_request_duration_seconds_count{leg="managed"}'], 1.0)
+        # The +Inf bucket is not optional: Prometheus conventions and the
+        # OpenMetrics spec both expect a final open bucket, and quantile maths
+        # needs a closed series.
+        self.assertEqual(counts[-1], 1.0, "+Inf must match _count")
         total = series['router_request_duration_seconds_sum{leg="managed"}']
         self.assertGreater(total, 0.0)
         self.assertLess(total, 1.0, "stubbed upstream answers instantly")
+
+    def test_slow_observation_still_lands_in_the_inf_bucket(self):
+        # A call slower than every finite bucket must remain visible to
+        # histogram_quantile(); only emitting finite bounds would hide it.
+        module = load_router()
+        module.observe("managed", 900.0)
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        self.assertEqual(series['router_request_duration_seconds_bucket{le="300",leg="managed"}'], 0.0)
+        self.assertEqual(series['router_request_duration_seconds_bucket{le="+Inf",leg="managed"}'], 1.0)
+        self.assertEqual(series['router_request_duration_seconds_count{leg="managed"}'], 1.0)
 
     def test_exposition_declares_help_and_type_exactly_once(self):
         module = load_router()

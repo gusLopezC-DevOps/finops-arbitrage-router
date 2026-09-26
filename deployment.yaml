@@ -14,7 +14,7 @@ spec:
   template:
     metadata:
       annotations:
-        backstage.guslopez.dev/config-checksum: "sha256:b8338496c8dc8f72e5ca12e43148c318550b5b224aaa46a922dd1529453be42f"
+        backstage.guslopez.dev/config-checksum: "sha256:5e87f219e807ad68a011eeac858f9b92cb354782de76ff0f6c8be0063bf91557"
       labels:
         app: finops-arbitrage-router
         backstage.io/kubernetes-id: finops-arbitrage-router

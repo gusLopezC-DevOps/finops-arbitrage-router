@@ -117,6 +117,8 @@ data:
             for bound, filled in zip(DURATION_BUCKETS, buckets):
                 lines.append("router_request_duration_seconds_bucket%s %s" % (
                     _labels([("le", str(bound)), ("leg", leg)]), filled))
+            lines.append("router_request_duration_seconds_bucket%s %s" % (
+                _labels([("le", "+Inf"), ("leg", leg)]), count))
         return "\n".join(lines) + "\n"
 
 
