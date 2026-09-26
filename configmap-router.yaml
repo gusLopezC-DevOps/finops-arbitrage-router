@@ -8,8 +8,8 @@ metadata:
     backstage.io/kubernetes-id: finops-arbitrage-router
 data:
   router.py: |
-    import json, os, sys, time, urllib.error, urllib.request
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import json, os, sys, threading, time, urllib.error, urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     PRIORITY = os.environ.get("ROUTER_PRIORITY", "cost-optimized")
     LOCAL = os.environ.get("LOCAL_ENDPOINT", "http://ollama-cpu.ml-serving.svc.cluster.local:11434").rstrip("/")
@@ -22,6 +22,102 @@ data:
     CROSS_LEG = os.environ.get("CROSS_LEG_FALLBACK", "true").strip().lower() not in ("false", "0", "no")
     TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "120"))
     RETRY_STATUS = {408, 425, 429}
+
+    # Prometheus metrics in the text exposition format, written by hand on
+    # purpose. The image is python:3.12-slim and the code ships in a ConfigMap,
+    # so pulling in prometheus_client would mean a new image build. Cardinality
+    # is bounded: leg, status_class, direction and kind are all small enums
+    # derived from our own routing decision, never from client input.
+    METRIC_TYPES = {
+        "router_up": "gauge",
+        "router_requests_total": "counter",
+        "router_tokens_total": "counter",
+        "router_fallbacks_total": "counter",
+        "router_upstream_errors_total": "counter",
+        "router_request_duration_seconds": "histogram",
+    }
+    METRIC_HELP = {
+        "router_up": "Router process is serving requests.",
+        "router_requests_total": "Chat completions served, by the leg that answered and the returned status class.",
+        "router_tokens_total": "Tokens accounted by the leg that answered, split prompt vs completion.",
+        "router_fallbacks_total": "Cross-leg fallbacks, with the leg that failed and the leg that answered.",
+        "router_upstream_errors_total": "Upstream call failures per leg, by HTTP status or exception type.",
+        "router_request_duration_seconds": "Upstream call duration per leg, including failed attempts.",
+    }
+    DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300)
+    LOCK = threading.Lock()
+    COUNTERS = {}
+    DURATIONS = {}
+
+
+    def inc(metric, labels, amount=1):
+        key = (metric, tuple(sorted(labels.items())))
+        with LOCK:
+            COUNTERS[key] = COUNTERS.get(key, 0) + amount
+
+
+    def observe(leg, seconds):
+        with LOCK:
+            entry = DURATIONS.setdefault(leg, [0, 0.0, [0] * len(DURATION_BUCKETS)])
+            entry[0] += 1
+            entry[1] += seconds
+            for index, bound in enumerate(DURATION_BUCKETS):
+                if seconds <= bound:
+                    entry[2][index] += 1
+
+
+    def record_tokens(leg, data):
+        # Both legs are OpenAI-shaped by the time we get here: the local one
+        # through to_openai(), the managed one natively. Providers that omit
+        # usage simply contribute nothing.
+        usage = data.get("usage") or {}
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        if prompt:
+            inc("router_tokens_total", {"leg": leg, "direction": "prompt"}, prompt)
+        if completion:
+            inc("router_tokens_total", {"leg": leg, "direction": "completion"}, completion)
+
+
+    def error_kind(exc):
+        if isinstance(exc, urllib.error.HTTPError):
+            return "http_%d" % exc.code
+        return type(exc).__name__
+
+
+    def _labels(pairs):
+        if not pairs:
+            return ""
+        body = ",".join(
+            '%s="%s"' % (key, str(value).replace("\\", "\\\\").replace('"', '\\"'))
+            for key, value in sorted(pairs)
+        )
+        return "{%s}" % body
+
+
+    def render_metrics():
+        with LOCK:
+            counters = list(COUNTERS.items())
+            durations = {leg: (count, total, list(buckets))
+                         for leg, (count, total, buckets) in DURATIONS.items()}
+        lines = ["# HELP router_up %s" % METRIC_HELP["router_up"], "# TYPE router_up gauge", "router_up 1"]
+        for metric in ("router_requests_total", "router_tokens_total",
+                       "router_fallbacks_total", "router_upstream_errors_total"):
+            lines.append("# HELP %s %s" % (metric, METRIC_HELP[metric]))
+            lines.append("# TYPE %s counter" % metric)
+        for (metric, label_items), value in sorted(counters):
+            lines.append("%s%s %s" % (metric, _labels(label_items), value))
+        lines.append("# HELP %s %s" % ("router_request_duration_seconds",
+                                       METRIC_HELP["router_request_duration_seconds"]))
+        lines.append("# TYPE router_request_duration_seconds histogram")
+        for leg in sorted(durations):
+            count, total, buckets = durations[leg]
+            lines.append("router_request_duration_seconds_count%s %s" % (_labels([("leg", leg)]), count))
+            lines.append("router_request_duration_seconds_sum%s %s" % (_labels([("leg", leg)]), round(total, 6)))
+            for bound, filled in zip(DURATION_BUCKETS, buckets):
+                lines.append("router_request_duration_seconds_bucket%s %s" % (
+                    _labels([("le", str(bound)), ("leg", leg)]), filled))
+        return "\n".join(lines) + "\n"
 
 
     def warn(message):
@@ -118,6 +214,7 @@ data:
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except ValueError:
                 self._fail("invalid JSON", 400)
+                inc("router_requests_total", {"leg": "none", "status_class": "4xx"})
                 return
             # Per-request priority wins (header, then body field), else the
             # Deployment default. The body field is popped so backends never
@@ -129,22 +226,36 @@ data:
                 attempt = dict(payload)
                 attempt["stream"] = False
                 apply_model(attempt, leg)
+                started = time.monotonic()
                 try:
                     data = call(leg, attempt, TIMEOUT)
                 except Exception as exc:
                     reason = describe(exc)
                     errors.append("%s leg: %s" % (leg["name"], reason))
+                    observe(leg["name"], time.monotonic() - started)
+                    inc("router_upstream_errors_total", {"leg": leg["name"], "kind": error_kind(exc)})
                     last = index == len(candidates) - 1
                     if not is_retryable(exc) or last:
                         self._fail("; ".join(errors), 502)
+                        inc("router_requests_total", {"leg": "none", "status_class": "5xx"})
                         return
                     warn("%s leg failed, falling back: %s" % (leg["name"], reason))
                     continue
+                observe(leg["name"], time.monotonic() - started)
                 if not leg["fallback"]:
                     data = to_openai(data, attempt["model"])
+                if index > 0:
+                    inc("router_fallbacks_total", {
+                        "from_leg": candidates[0]["name"],
+                        "to_leg": leg["name"],
+                        "reason": "upstream_failure",
+                    })
+                inc("router_requests_total", {"leg": leg["name"], "status_class": "2xx"})
+                record_tokens(leg["name"], data)
                 self._ok(data, leg, index > 0)
                 return
             self._fail("; ".join(errors) or "no upstream available", 502)
+            inc("router_requests_total", {"leg": "none", "status_class": "5xx"})
 
         def _ok(self, data, leg, fell_back):
             self.send_response(200)
@@ -171,6 +282,17 @@ data:
                 self.end_headers()
                 self.wfile.write(b"ok")
                 return
+            if self.path == "/metrics":
+                # Served on the same port as the API so no Service, port or
+                # NetworkPolicy change is needed. Prometheus is a plain
+                # scraper, so this stays a GET with no auth.
+                body = render_metrics().encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(404)
             self.end_headers()
 
@@ -178,4 +300,7 @@ data:
             pass
 
 
-    HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+    # Threading, not single-threaded: a chat completion can block for
+    # UPSTREAM_TIMEOUT seconds, and with HTTPServer that would also stall the
+    # health and metrics endpoints behind it.
+    ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
