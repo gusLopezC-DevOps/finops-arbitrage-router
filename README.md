@@ -117,6 +117,11 @@ Model resolution is owned by the router: the local leg defaults to
 name such as `llama3.2:1b`, which the managed gateway cannot resolve. A
 provider-prefixed model (`groq/openai/gpt-oss-20b`) is forwarded untouched.
 
+> The `servicemonitor.yaml` in this template is what gets `/metrics` into
+> TSDB. It only works because the Prometheus CR selects ServiceMonitors by the
+> label `release: monitoring`; drop that label and the object is accepted and
+> then ignored, so the router looks healthy while exporting nothing.
+
 ## Cross-leg fallback
 
 The router never leaves a caller with a 502 just because one leg is down: when

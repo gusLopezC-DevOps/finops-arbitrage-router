@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: finops-arbitrage-router
+  labels:
+    # Selected by prometheus-kube-prometheus-prometheus through
+    # spec.serviceMonitorSelector.matchLabels. Without this label the object is
+    # accepted by the API server and then silently ignored forever, which is
+    # the failure mode that kept these series out of TSDB.
+    release: monitoring
+    backstage.io/kubernetes-id: finops-arbitrage-router
+spec:
+  selector:
+    matchLabels:
+      app: finops-arbitrage-router
+  endpoints:
+    - port: http
+      path: /metrics
+      # Matches the Prometheus CR scrapeInterval. /metrics is served from
+      # memory, so there is nothing to gain from scraping less often.
+      interval: 30s
+      scheme: http
