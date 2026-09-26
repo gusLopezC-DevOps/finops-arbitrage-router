@@ -117,6 +117,46 @@ def post(module, body, headers=None):
     return int(lines[0].split()[1]), headers, json.loads(payload or b"{}")
 
 
+def get(module, path):
+    """Drive one GET through the handler and return (status, headers, body)."""
+    handler = module.Handler.__new__(module.Handler)
+    handler.request_version = "HTTP/1.1"
+    handler.command = "GET"
+    handler.path = path
+    handler.requestline = "GET %s HTTP/1.1" % path
+    handler.client_address = ("127.0.0.1", 40000)
+    handler.server = None
+    handler.headers = Message()
+    handler.rfile = io.BytesIO(b"")
+    handler.wfile = io.BytesIO()
+    handler.do_GET()
+
+    raw = handler.wfile.getvalue()
+    head, _, payload = raw.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    headers = Message()
+    for line in lines[1:]:
+        key, _, value = line.partition(":")
+        headers[key.strip()] = value.strip()
+    return int(lines[0].split()[1]), headers, payload.decode()
+
+
+def parse_exposition(text):
+    """Minimal Prometheus text parser: {series: value}, HELP/TYPE counted."""
+    series, declared = {}, {}
+    for line in text.splitlines():
+        if line.startswith("# HELP "):
+            name = line.split()[2]
+            declared.setdefault(name, set()).add("HELP")
+        elif line.startswith("# TYPE "):
+            name = line.split()[2]
+            declared.setdefault(name, set()).add("TYPE")
+        elif line.strip():
+            key, _, value = line.rpartition(" ")
+            series[key] = float(value)
+    return series, declared
+
+
 def stub_upstream(module, behaviours):
     """Return the list of upstream calls made, stubbed per `behaviours`."""
     calls = []
@@ -273,6 +313,117 @@ class FallbackTest(unittest.TestCase):
         status, _, body = post(module, b"{no-json")
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid JSON")
+
+
+class MetricsTest(unittest.TestCase):
+    def test_metrics_endpoint_is_served_on_the_api_port(self):
+        module = load_router()
+        status, headers, body = get(module, "/metrics")
+        self.assertEqual(status, 200)
+        self.assertIn("text/plain", headers.get("Content-Type"))
+        self.assertIn("version=0.0.4", headers.get("Content-Type"))
+        series, _ = parse_exposition(body)
+        self.assertEqual(series.get("router_up"), 1.0)
+
+    def test_unknown_get_path_is_still_404(self):
+        module = load_router()
+        status, _, _ = get(module, "/nope")
+        self.assertEqual(status, 404)
+
+    def test_managed_success_counts_requests_and_tokens(self):
+        module = load_router()
+        reply = dict(OPENAI_REPLY, usage={"prompt_tokens": 100, "completion_tokens": 20})
+        stub_upstream(module, [reply])
+        post(module, json.dumps({"messages": []}))
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        self.assertEqual(series['router_requests_total{leg="managed",status_class="2xx"}'], 1.0)
+        self.assertEqual(series['router_tokens_total{direction="prompt",leg="managed"}'], 100.0)
+        self.assertEqual(series['router_tokens_total{direction="completion",leg="managed"}'], 20.0)
+        self.assertNotIn('router_fallbacks_total{from_leg="managed",reason="upstream_failure",to_leg="local"}', series)
+
+    def test_local_success_uses_ollama_token_counts(self):
+        module = load_router({"ROUTER_PRIORITY": "cost-optimized"})
+        stub_upstream(module, [OLLAMA_REPLY])
+        post(module, json.dumps({"messages": []}))
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        self.assertEqual(series['router_requests_total{leg="local",status_class="2xx"}'], 1.0)
+        self.assertEqual(series['router_tokens_total{direction="prompt",leg="local"}'], 11.0)
+        self.assertEqual(series['router_tokens_total{direction="completion",leg="local"}'], 7.0)
+
+    def test_cross_leg_fallback_is_counted_with_both_legs(self):
+        module = load_router()
+        stub_upstream(module, [upstream_error(500), OLLAMA_REPLY])
+        post(module, json.dumps({"messages": []}))
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        self.assertEqual(series['router_fallbacks_total{from_leg="managed",reason="upstream_failure",to_leg="local"}'], 1.0)
+        self.assertEqual(series['router_requests_total{leg="local",status_class="2xx"}'], 1.0)
+        self.assertEqual(series['router_upstream_errors_total{kind="http_500",leg="managed"}'], 1.0)
+
+    def test_both_legs_failing_counts_5xx_and_no_leg(self):
+        module = load_router()
+        stub_upstream(module, [upstream_error(503, b"x"), OSError("refused")])
+        post(module, json.dumps({"messages": []}))
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        self.assertEqual(series['router_requests_total{leg="none",status_class="5xx"}'], 1.0)
+        self.assertEqual(series['router_upstream_errors_total{kind="http_503",leg="managed"}'], 1.0)
+        self.assertEqual(series['router_upstream_errors_total{kind="OSError",leg="local"}'], 1.0)
+
+    def test_invalid_json_counts_4xx(self):
+        module = load_router()
+        stub_upstream(module, [])
+        post(module, b"{no-json")
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        self.assertEqual(series['router_requests_total{leg="none",status_class="4xx"}'], 1.0)
+
+    def test_counters_accumulate_across_requests(self):
+        module = load_router()
+        stub_upstream(module, [OPENAI_REPLY, OPENAI_REPLY, OPENAI_REPLY])
+        for _ in range(3):
+            post(module, json.dumps({"messages": []}))
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        self.assertEqual(series['router_requests_total{leg="managed",status_class="2xx"}'], 3.0)
+
+    def test_duration_histogram_is_monotonic_per_leg(self):
+        module = load_router()
+        stub_upstream(module, [OPENAI_REPLY])
+        post(module, json.dumps({"messages": []}))
+        series, _ = parse_exposition(get(module, "/metrics")[2])
+        buckets = [(bound, series['router_request_duration_seconds_bucket{le="%s",leg="managed"}' % bound])
+                   for bound in ("0.05", "0.1", "0.25", "0.5", "1", "2.5", "5",
+                                 "10", "30", "60", "120", "300")]
+        counts = [count for _, count in buckets]
+        self.assertEqual(counts, sorted(counts), "buckets must be monotonic")
+        self.assertEqual(series['router_request_duration_seconds_count{leg="managed"}'], 1.0)
+        total = series['router_request_duration_seconds_sum{leg="managed"}']
+        self.assertGreater(total, 0.0)
+        self.assertLess(total, 1.0, "stubbed upstream answers instantly")
+
+    def test_exposition_declares_help_and_type_exactly_once(self):
+        module = load_router()
+        _, declared = parse_exposition(get(module, "/metrics")[2])
+        for name, kinds in declared.items():
+            self.assertEqual(kinds, {"HELP", "TYPE"}, "%s metadata is wrong" % name)
+        self.assertIn("router_request_duration_seconds", declared)
+        self.assertIn("router_tokens_total", declared)
+
+    def test_metrics_never_leak_the_api_key_or_payload(self):
+        module = load_router()
+        stub_upstream(module, [OPENAI_REPLY])
+        post(module, json.dumps({"messages": [{"role": "user", "content": "secreto-de-usuario"}]}))
+        body = get(module, "/metrics")[2]
+        self.assertNotIn("secreto", body)
+        self.assertNotIn(BASE_ENV["FALLBACK_API_KEY"], body)
+        self.assertNotIn("Bearer", body)
+
+    def test_metrics_do_not_change_the_public_contract(self):
+        module = load_router()
+        calls = stub_upstream(module, [OPENAI_REPLY])
+        status, headers, body = post(module, json.dumps({"messages": []}))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, OPENAI_REPLY)
+        self.assertEqual(headers.get("X-Router-Leg"), "managed")
+        self.assertEqual(calls[0]["ua"], "finops-arbitrage-router/1.0")
+        get(module, "/metrics")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ that satisfies it.
 | `Ingress/<name>` | Kong entrypoint, with the platform DLP plugins (`pii-redaction`, `ai-prompt-guard`) |
 | `NetworkPolicy/<name>-egress` | Zero-trust egress: DNS, local Ollama, and internet only for the managed fallback |
 
+The router also exposes `/metrics` on the same port as the API (no extra Service,
+port or NetworkPolicy needed). See [Metrics](#metrics).
+
 ## Routing policy
 
 1. **cost-optimized** — traffic is pinned to the local Ollama CPU model
@@ -24,9 +27,49 @@ that satisfies it.
 
 ## Unit economics
 
-Cost is attributed per request using the model, token counts and the declared
-SLA. Dashboards live in Grafana (OpenCost + Langfuse token usage), which lets
-FinOps charge back to the owning team's cost centre.
+The router reports **tokens and which leg answered** as Prometheus metrics, which
+is what you need to answer "how much of this traffic was free?". What it does
+**not** report is money: the router never learns which model the managed gateway
+picked, so it cannot turn tokens into a price. `configmap-sla.yaml` still
+declares `cost.max_usd_per_1k_tokens` and `latency.max_p95_ms`, but `router.py`
+does not read that file — treat those values as a declaration of intent, not as
+an enforced budget. Wiring them up is the obvious next step, and it needs a price
+table that lives outside the router.
+
+## Metrics
+
+`GET /metrics` on the router port, in Prometheus text exposition format, written
+with the standard library only. A new dependency would have meant a new image
+build, and the code ships in a ConfigMap precisely so that the router stays
+dependency-free. Cardinality is bounded: every label value comes from the
+router's own routing decision, never from client input, and no prompt, model
+name or credential is ever exported.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `router_up` | gauge | — |
+| `router_requests_total` | counter | `leg`, `status_class` |
+| `router_tokens_total` | counter | `leg`, `direction` |
+| `router_fallbacks_total` | counter | `from_leg`, `to_leg`, `reason` |
+| `router_upstream_errors_total` | counter | `leg`, `kind` (`http_500`, `TimeoutError`, …) |
+| `router_request_duration_seconds` | histogram | `leg` (includes failed attempts) |
+
+```promql
+# share of traffic served free, on the local model
+sum(rate(router_requests_total{leg="local"}[5m]))   / sum(rate(router_requests_total[5m]))
+# share that leaves for a paid endpoint
+sum(rate(router_requests_total{leg="managed"}[5m])) / sum(rate(router_requests_total[5m]))
+# how often a leg had to rescue the other one
+sum(rate(router_fallbacks_total[5m]))               / sum(rate(router_requests_total[5m]))
+# p95 latency per leg
+histogram_quantile(0.95, sum by (le,leg)(rate(router_request_duration_seconds_bucket[5m])))
+# token burn per leg
+sum by (leg,direction)(rate(router_tokens_total[5m]))
+```
+
+The histogram deliberately observes **every** upstream attempt, including the ones
+that fail, so a slow primary leg shows up in its own latency before the fallback
+hides it from the client.
 
 ## Rollout
 
@@ -77,7 +120,8 @@ provider-prefixed model (`groq/openai/gpt-oss-20b`) is forwarded untouched.
 ## Cross-leg fallback
 
 The router never leaves a caller with a 502 just because one leg is down: when
-the primary leg fails it retries **once** on the other one.
+the primary leg fails it retries **once** on the other one. Each fallback is
+counted in `router_fallbacks_total`.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -99,7 +143,7 @@ reply is normalized to `choices[].message` with `usage` and `finish_reason`, so
 The local leg never sends credentials and always uses `LOCAL_MODEL`, even if
 the caller asked for a provider-prefixed model that only exists upstream.
 
-Tests: `python3 tests/test_router_fallback.py` (stdlib only, 15 cases, no
+Tests: `python3 tests/test_router_fallback.py` (stdlib only, 27 cases, no
 cluster needed).
 
 > Platform note: Argo CD excludes endpoint resources (`Endpoints` and
